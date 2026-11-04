@@ -24,7 +24,7 @@ Accio 的这几处修复，所以这里的做法是：**用公开的插件源码
 | 插件包 | `data340\plugins\agent2api-providers\<version>\` |
 | 网关镜像 | `agent2api:3.4.0-teamspace` |
 | 面板 / API | `http://localhost:3066/` ｜ `http://localhost:3066/v1` |
-| 旧版本（已归档） | 容器 `agent2api`（停止，`--restart=no`），数据 `...\agent2api\data-3.0.8-teamspace-archive`，镜像 `agent2api:3.0.8-teamspace-stable`，git tag `stable/3.0.8-teamspace` |
+| 旧版本（已归档） | 容器 `agent2api`（停止，`--restart=no`），数据 `E:\Program\DOCKER\agent2api-3.0.8-archive`，镜像 `agent2api:3.0.8-teamspace-stable`，git tag `stable/3.0.8-teamspace` |
 
 ## 重建插件
 
