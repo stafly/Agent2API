@@ -71,8 +71,19 @@ pub const MODEL_CONFIG_PATH_V2: &str = "/api/llm/config/v2";
 /// OAuth 客户端 id（桌面端常量；两地逐字相同）
 pub const CLIENT_ID: &str = "accio-work";
 
-/// ADK 推理请求的租户（桌面端默认值 `ADK_TENANT || "accio-agent"`）
-pub const DEFAULT_TENANT: &str = "accio-agent";
+/// ADK 推理请求的租户（`ACCIO_TENANT` 可覆盖；**缺省是空串**）。
+///
+/// ── 为什么缺省不是 `accio-agent`（2026-10 实测，会直接封掉部分模型）──
+/// 上一版照抄了 accio-manager 的默认值，代价是**一部分模型整类不可用**：上游对
+/// `tenant=accio-agent` 回 `IAI ERR: tenant=accio-agent no permission to access
+/// model=gemini-4-argon`（HTTP 200 + 帧内 error_code 505，网关翻成 502）。
+/// 桌面端发的是**空串**（`ADK_TENANT` 未设即 `""`，见 sdk.log 里 `llm.call` 的
+/// `input.tenant: ""`），上游按 token 自己解析租户。同一账号、同一 token、只把
+/// `tenant` 由 `accio-agent` 换成空串：Gemini 4 Argon 立刻正常出流，DeepSeek 等
+/// 原本可用的模型不受影响。
+pub fn tenant() -> String {
+    env_text("ACCIO_TENANT").unwrap_or_default()
+}
 /// ADK 推理请求的来源标记（桌面端默认值 `ADK_IAI_TAG || "phoenix-desktop"`）
 pub const DEFAULT_IAI_TAG: &str = "phoenix-desktop";
 /// 推理请求头里的客户端版本（桌面端取 appVersion；缺省给一个近版号）

@@ -12,7 +12,7 @@
 //! ```jsonc
 //! {
 //!   "model": "gemini-3-flash-preview",
-//!   "tenant": "accio-agent", "iai_tag": "phoenix-desktop", "empid": "",
+//!   "tenant": "", "iai_tag": "phoenix-desktop", "empid": "",
 //!   "request_id": "…", "token": "<accessToken>",
 //!   "contents": [ {"role":"user","parts":[{"text":"hi"}]},
 //!                 {"role":"model","parts":[{"function_call":{"id":"…","name":"f","args_json":"{}"}}]},
@@ -365,7 +365,9 @@ pub fn build_upstream_body(
     let request_id = crate::server::core::upstream::request::new_request_id();
     let mut payload = Map::new();
     payload.insert("model".to_string(), Value::String(model_code.to_string()));
-    payload.insert("tenant".to_string(), Value::String(super::endpoints::DEFAULT_TENANT.to_string()));
+    // 租户**缺省留空**：上游按 token 解析，写死成 `accio-agent` 会让部分模型
+    // 被判「该租户无权限」（见 `endpoints::tenant`）。
+    payload.insert("tenant".to_string(), Value::String(super::endpoints::tenant()));
     payload.insert("iai_tag".to_string(), Value::String(super::endpoints::DEFAULT_IAI_TAG.to_string()));
     payload.insert("empid".to_string(), Value::String(String::new()));
     payload.insert("request_id".to_string(), Value::String(request_id.clone()));
