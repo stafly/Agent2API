@@ -441,35 +441,43 @@ impl Translator {
     /// 又发了一遍（实测会重复），调用方据此**不要**再下发一次参数 —— 客户端是
     /// 按片段拼接 `arguments` 的，重复下发会拼成 `{...}{...}` 这种非法 JSON。
     fn accumulate_call(&mut self, id: &str, name: &str, args: &str) -> (i64, bool) {
-        // 先判「是不是同一个调用的下一段」：id 两非空时必须相等，否则按名字。
-        let same_call = self.tool_state.last().is_some_and(|entry| {
-            let id_ok = id.is_empty() || entry.id.is_empty() || id == entry.id;
-            let name_ok = name.is_empty() || entry.name.is_empty() || name == entry.name;
-            id_ok && name_ok
-        });
-        if same_call {
-            if let Some(entry) = self.tool_state.last_mut() {
-                // ── 重复整段：上游会把同一个 part 再发一遍（实测确实会）──────
-                // 参数一模一样 = 同一调用的回声，不能再起一个新调用 —— 否则
-                // 一个工具调用会被放大成两条，客户端按 id 配对时全乱。
+        // ① 有 id：按 id 认调用（同 id 的后续片段 / 整段回声都落在这里）
+        if !id.is_empty() {
+            if let Some(index) = self.tool_state.iter().position(|entry| entry.id == id) {
+                let entry = &mut self.tool_state[index];
                 if !args.is_empty() && entry.args == args {
-                    return ((self.tool_state.len() - 1) as i64, false);
+                    return (index as i64, false);
                 }
                 let previous_complete =
                     !entry.args.is_empty() && serde_json::from_str::<Value>(&entry.args).is_ok();
                 let incoming_complete = !args.is_empty() && serde_json::from_str::<Value>(args).is_ok();
-                // 两段都是完整 JSON 且 id 不同（或没有 id）→ 那是另一个调用
-                let same_id = !id.is_empty() && id == entry.id;
-                if !(previous_complete && incoming_complete) || same_id {
-                    if entry.id.is_empty() && !id.is_empty() {
-                        entry.id = id.to_string();
-                    }
-                    if entry.name.is_empty() && !name.is_empty() {
-                        entry.name = name.to_string();
-                    }
-                    entry.args.push_str(args);
-                    return ((self.tool_state.len() - 1) as i64, true);
+                // 同 id + 又被整段重发一次（实测上游会重放整组调用）→ 不回放
+                if previous_complete && incoming_complete {
+                    return (index as i64, false);
                 }
+                if entry.name.is_empty() && !name.is_empty() {
+                    entry.name = name.to_string();
+                }
+                entry.args.push_str(args);
+                return (index as i64, true);
+            }
+        }
+        // ② 没有 id：参数与已有某条一模一样 = 同一调用的回声（重放时常丢 id）
+        if !args.is_empty() {
+            if let Some(index) = self
+                .tool_state
+                .iter()
+                .position(|entry| entry.name == name && entry.args == args)
+            {
+                return (index as i64, false);
+            }
+        }
+        // ③ 没有 id 且参数不完整：并进最后一条同名调用（分片到达）
+        let incoming_complete = !args.is_empty() && serde_json::from_str::<Value>(args).is_ok();
+        if !incoming_complete && !name.is_empty() {
+            if let Some(index) = self.tool_state.iter().rposition(|entry| entry.name == name) {
+                self.tool_state[index].args.push_str(args);
+                return (index as i64, true);
             }
         }
         // id 还是空的就别留空：客户端拿到一个没有 id 的 tool_call 时只能自己编，

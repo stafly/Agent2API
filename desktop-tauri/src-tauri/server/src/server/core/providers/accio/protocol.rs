@@ -223,10 +223,28 @@ fn assistant_tool_calls_parts(tool_calls: &Value) -> Vec<Value> {
         .collect()
 }
 
-/// 工具结果（role = tool）→ ADK 的 function_response part
-fn tool_result_part(message: &Value) -> Value {
+/// 工具结果（role = tool）→ ADK 的 function_response part。
+///
+/// ── `name` 必须能补上（2026-11 实测，缺了是硬 400）──────────────
+/// OpenAI 的 tool 消息里 `name` 是可选的（多数客户端根本不发），但 ADK 的
+/// `function_response` 是 **proto 必填**：缺了上游直接回
+/// `contents[N].parts[0].function_response.name: [REQUIRED_FIELD_MISSING]`
+/// （HTTP 500 包一层 400），整轮对话就废了。
+/// 因此这里按 `tool_call_id` 去前面的 assistant 消息里**反查函数名**
+/// （`call_names`，由 [`assistant_tool_calls_parts`] 的同一条消息登记）。
+fn tool_result_part(message: &Value, call_names: &std::collections::HashMap<String, String>) -> Value {
     let id = message.get("tool_call_id").and_then(Value::as_str).unwrap_or("").to_string();
-    let name = message.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+    let mut name = message.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+    if name.is_empty() {
+        if let Some(found) = call_names.get(&id) {
+            name = found.clone();
+        }
+    }
+    if name.is_empty() {
+        // 还查不到（历史里缺了那条 assistant 消息）：给一个占位而不是空串 ——
+        // 空串在这里是硬 400，占位至少能让这一轮跑完
+        name = "tool".to_string();
+    }
     let content = match message.get("content") {
         Some(Value::String(text)) => text.clone(),
         Some(other) => other.to_string(),
@@ -269,6 +287,8 @@ pub fn build_upstream_body(
     let mut contents: Vec<Value> = Vec::new();
     let mut system_parts: Vec<String> = Vec::new();
     let mut pending_parts: Vec<Value> = Vec::new();
+    // 调用 id → 函数名：tool 消息只带 id，ADK 的 function_response 要 name
+    let mut call_names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let messages = body.get("messages").and_then(Value::as_array).cloned().unwrap_or_default();
 
     // ── 消息归一 ────────────────────────────────────────────────
@@ -303,16 +323,28 @@ pub fn build_upstream_body(
                 }
             }
             "tool" | "function" => {
-                pending_parts.push(tool_result_part(message));
+                pending_parts.push(tool_result_part(message, &call_names));
                 // 工具结果与下一条用户消息不合并（上游按 tool 角色识别结果）
                 push_content("tool", std::mem::take(&mut pending_parts), &mut contents);
             }
             "assistant" => {
+                // 先把这条消息里的「调用 id → 函数名」登记下来：后面的 tool 消息
+                // 只带 `tool_call_id`，ADK 那边却要求 `function_response.name`
+                let tool_calls = message.get("tool_calls").unwrap_or(&Value::Null);
+                for call in tool_calls.as_array().into_iter().flatten() {
+                    let id = call.get("id").and_then(Value::as_str).unwrap_or("");
+                    let name = call
+                        .get("function")
+                        .and_then(|function| function.get("name"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    if !id.is_empty() && !name.is_empty() {
+                        call_names.insert(id.to_string(), name.to_string());
+                    }
+                }
                 let mut parts: Vec<Value> = Vec::new();
                 content_to_parts(message.get("content").unwrap_or(&Value::Null), &mut parts);
-                parts.extend(assistant_tool_calls_parts(
-                    message.get("tool_calls").unwrap_or(&Value::Null),
-                ));
+                parts.extend(assistant_tool_calls_parts(tool_calls));
                 push_content("model", parts, &mut contents);
             }
             _ => {
