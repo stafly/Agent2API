@@ -1,4 +1,4 @@
-# 3.4.0 + 自编译「提供商增强」插件（Accio 公司空间）
+﻿# 3.4.0 + 自编译「提供商增强」插件（Accio 公司空间）
 
 ## 这套部署是什么
 
@@ -6,7 +6,7 @@
 Accio 的这几处修复，所以这里的做法是：**用公开的插件源码编一份带补丁的插件**，装进 3.4.0 网关。
 
 - 插件源码（上游）：`https://github.com/ProvidersPlugin/Agent2Providers`（tag `v3.4.0`，公开）
-- **带补丁的分支**：`https://github.com/stafly/Agent2Providers/tree/feat/accio-teamspace`（提交 `83bc975`）——要重建就 `git clone` 这个分支，别用上游 tag
+- **带补丁的分支**：`https://github.com/stafly/Agent2Providers/tree/feat/accio-teamspace`（提交 `4884368`）——要重建就 `git clone` 这个分支，别用上游 tag
 - 补丁文件：`patches/accio-teamspace.patch`（同一份改动的 patch 形态，便于离线或对着上游 tag 打）
 - 补丁内容：
   1. 公司空间：账号/凭证新增 `teamId` / `teamName`，推理请求带 `x-team-id`
