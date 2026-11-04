@@ -18,7 +18,11 @@
 //!      → 翻成 `delta.reasoning_content`；
 //!   2. **工具调用的参数是字符串**（`args_json`），而且**可能分片到达**
 //!      （`tool_config` 里的 `streamFunctionCallArguments` 就是让上游这么发的）
-//!      → 按「名字相同且已有内容仍是合法 JSON 就开新调用」的规则聚合；
+//!      → 按「id 相同且已有内容仍是合法 JSON 就开新调用」的规则聚合；
+//!   2b. **调用 id 不在外层 part 上**：外层 `function_call` 只有 name / args_json，
+//!      真正的 `id`（如 `call_1591653`）在 `raw_response_json.candidates[].
+//!      content.parts[].functionCall.id` 里 → 必须捞回来（见 `raw_call_ids`），
+//!      否则客户端拿到的 tool_call 没有 id，后续 tool 消息配不上这次调用；
 //!   3. **业务错误写在帧里**（`error_code` / `error_message`），HTTP 常是 200
 //!      → 首帧预读与流内都要判（见 `chat.rs` 与 `mod.rs` 的 `forward_conversation`）。
 //!
@@ -153,6 +157,64 @@ fn parse_usage(usage: &Value) -> Value {
     usage
 }
 
+/// 从 `raw_response_json` 里捞出 function_call 的 id（按出现顺序，带名字）。
+///
+/// ── 为什么必须捞（2026-11 实测）─────────────────────────────
+/// 上游 ADK 帧里**外层** `function_call` part 只有 `name` 与 `args_json`，
+/// 没有 `id`；真正的调用 id 藏在 `raw_response_json.candidates[].content.parts[]
+/// .functionCall.id`（实测形如 `call_1591653`）。不取它就只能自己造一个 ——
+/// 客户端拿到的工具调用**没有稳定 id**，后续 tool 消息里的 `tool_call_id` 就
+/// 对不上「是哪一次调用」，表现为客户端直接拒绝继续：
+/// `tool/result at seq N requires toolCallId matching its tool source`。
+fn raw_call_ids(value: &Value) -> Vec<(String, String)> {
+    let Some(raw) = value.get("raw_response_json").and_then(Value::as_str) else {
+        return Vec::new();
+    };
+    let Ok(parsed) = serde_json::from_str::<Value>(raw) else {
+        return Vec::new();
+    };
+    let Some(candidates) = parsed.get("candidates").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, String)> = Vec::new();
+    for candidate in candidates {
+        let Some(parts) = candidate
+            .get("content")
+            .and_then(|content| content.get("parts"))
+            .and_then(Value::as_array)
+        else {
+            continue;
+        };
+        for part in parts {
+            let Some(call) = part.get("functionCall").or_else(|| part.get("function_call")) else {
+                continue;
+            };
+            let id = text_field(call, "id", "id");
+            if id.is_empty() {
+                continue;
+            }
+            out.push((text_field(call, "name", "name"), id));
+        }
+    }
+    out
+}
+
+/// 按顺序（优先同名）取下一个 id，并推进游标。
+fn take_call_id(ids: &[(String, String)], name: &str, cursor: &mut usize) -> Option<String> {
+    for index in *cursor..ids.len() {
+        if ids[index].0 == name {
+            *cursor = index + 1;
+            return Some(ids[index].1.clone());
+        }
+    }
+    if *cursor < ids.len() {
+        let id = ids[*cursor].1.clone();
+        *cursor += 1;
+        return Some(id);
+    }
+    None
+}
+
 /// 一帧 `data:` 的 JSON 文本 → [`Frame`]。
 ///
 /// 解析失败返回 None（非 JSON 的心跳帧、`[DONE]` 之外的控制帧都按「无内容」跳过，
@@ -178,8 +240,21 @@ pub fn parse_frame(data: &str) -> Option<Frame> {
     }
     if let Some(content) = object.get("content") {
         if let Some(parts) = content.get("parts").and_then(Value::as_array) {
+            // 外层 part 不带 id（见 `raw_call_ids`），按 `raw_response_json`
+            // 里的顺序把它补回去 —— 工具调用没有稳定 id，客户端的 tool 消息
+            // 就配不上这次调用
+            let ids = raw_call_ids(&value);
+            let mut cursor = 0usize;
             for part in parts {
-                frame.parts.push(parse_part(part));
+                let mut parsed = parse_part(part);
+                if let Part::FunctionCall { id, name, .. } = &mut parsed {
+                    if id.is_empty() {
+                        if let Some(found) = take_call_id(&ids, name, &mut cursor) {
+                            *id = found;
+                        }
+                    }
+                }
+                frame.parts.push(parsed);
             }
         }
     }
@@ -264,6 +339,11 @@ pub struct Translator {
     reasoning: String,
     /// 收到过任何工具调用（决定收尾的 finish_reason 是 tool_calls 还是 stop）
     saw_tool_call: bool,
+    /// 上游连 id 都没给时，用来造一个**唯一**的调用 id 的盐（每条回复一个）。
+    ///
+    /// 只按序号造（`call_0` / `call_1`）会让不同轮次的工具调用撞 id —— 客户端
+    /// 按 id 配对 tool 结果时就会配错对象（`toolCallId` 不匹配那类报错）。
+    call_salt: String,
 }
 
 impl Translator {
@@ -279,6 +359,12 @@ impl Translator {
             content: String::new(),
             reasoning: String::new(),
             saw_tool_call: false,
+            // 8 位足够避开「同一会话里两轮撞车」，又不至于把 id 撑长
+            call_salt: crate::server::core::upstream::request::new_request_id()
+                .replace('-', "")
+                .chars()
+                .take(8)
+                .collect(),
         }
     }
 
@@ -313,10 +399,14 @@ impl Translator {
                     }
                 }
                 Part::FunctionCall { id, name, args } => {
-                    let index = self.accumulate_call(id, name, args);
+                    let (index, contributed) = self.accumulate_call(id, name, args);
                     // 先取快照再改标记：借用与可变借用分开，避免交叉持有
+                    // `announce` = 「这一次是该调用的首帧」—— OpenAI 的约定是首帧带
+                    // id 与 name、之后只带参数。所以取的是 `!entry.announced`：
+                    // 取反写错过一次，结果整条流里**一个 id 都没下发**，客户端只能
+                    // 自己编 id，后续 tool 消息必然配不上（见模块头要点 2b）。
                     let (announce, call_id, call_name) = match self.tool_state.get(index as usize) {
-                        Some(entry) => (entry.announced, entry.id.clone(), entry.name.clone()),
+                        Some(entry) => (!entry.announced, entry.id.clone(), entry.name.clone()),
                         None => (true, String::new(), String::new()),
                     };
                     if let Some(entry) = self.tool_state.get_mut(index as usize) {
@@ -324,7 +414,7 @@ impl Translator {
                     }
                     // 首帧（要报 id/name）或有参数可发时下发；首帧即使参数为空也发，
                     // 否则客户端拿不到这个工具调用的名字
-                    if announce || !args.is_empty() {
+                    if announce || (contributed && !args.is_empty()) {
                         self.saw_tool_call = true;
                         out.push(Delta::ToolCall {
                             index,
@@ -347,38 +437,57 @@ impl Translator {
     /// 多个 part 各带一段）。但也可能一次给全（多个同名调用的完整 JSON）。
     /// 判据：**已有内容仍是合法 JSON 且新来的也是完整 JSON → 那是新调用**；
     /// 否则按续写拼上去。这样两种形态都能正确聚合（详见模块头要点 2）。
-    fn accumulate_call(&mut self, id: &str, name: &str, args: &str) -> i64 {
-        let can_extend = self.tool_state.last().is_some_and(|entry| {
-            if !id.is_empty() && !entry.id.is_empty() && id != entry.id {
-                return false;
-            }
-            if !name.is_empty() && !entry.name.is_empty() && name != entry.name {
-                return false;
-            }
-            // 已有内容是完整 JSON 且新片段也完整 → 不是续写
-            let previous_complete = !entry.args.is_empty() && serde_json::from_str::<Value>(&entry.args).is_ok();
-            let incoming_complete = !args.is_empty() && serde_json::from_str::<Value>(args).is_ok();
-            !(previous_complete && incoming_complete)
+    /// 返回 `(index, 是否贡献了新内容)`：`false` 表示这一 part 是上游把同一段
+    /// 又发了一遍（实测会重复），调用方据此**不要**再下发一次参数 —— 客户端是
+    /// 按片段拼接 `arguments` 的，重复下发会拼成 `{...}{...}` 这种非法 JSON。
+    fn accumulate_call(&mut self, id: &str, name: &str, args: &str) -> (i64, bool) {
+        // 先判「是不是同一个调用的下一段」：id 两非空时必须相等，否则按名字。
+        let same_call = self.tool_state.last().is_some_and(|entry| {
+            let id_ok = id.is_empty() || entry.id.is_empty() || id == entry.id;
+            let name_ok = name.is_empty() || entry.name.is_empty() || name == entry.name;
+            id_ok && name_ok
         });
-        if can_extend {
+        if same_call {
             if let Some(entry) = self.tool_state.last_mut() {
-                if entry.id.is_empty() && !id.is_empty() {
-                    entry.id = id.to_string();
+                // ── 重复整段：上游会把同一个 part 再发一遍（实测确实会）──────
+                // 参数一模一样 = 同一调用的回声，不能再起一个新调用 —— 否则
+                // 一个工具调用会被放大成两条，客户端按 id 配对时全乱。
+                if !args.is_empty() && entry.args == args {
+                    return ((self.tool_state.len() - 1) as i64, false);
                 }
-                if entry.name.is_empty() && !name.is_empty() {
-                    entry.name = name.to_string();
+                let previous_complete =
+                    !entry.args.is_empty() && serde_json::from_str::<Value>(&entry.args).is_ok();
+                let incoming_complete = !args.is_empty() && serde_json::from_str::<Value>(args).is_ok();
+                // 两段都是完整 JSON 且 id 不同（或没有 id）→ 那是另一个调用
+                let same_id = !id.is_empty() && id == entry.id;
+                if !(previous_complete && incoming_complete) || same_id {
+                    if entry.id.is_empty() && !id.is_empty() {
+                        entry.id = id.to_string();
+                    }
+                    if entry.name.is_empty() && !name.is_empty() {
+                        entry.name = name.to_string();
+                    }
+                    entry.args.push_str(args);
+                    return ((self.tool_state.len() - 1) as i64, true);
                 }
-                entry.args.push_str(args);
-                return (self.tool_state.len() - 1) as i64;
             }
         }
+        // id 还是空的就别留空：客户端拿到一个没有 id 的 tool_call 时只能自己编，
+        // 编出来的那把和上游/后续 tool 消息里的 id 必然对不上（见模块头）。
+        // 这里造一个「本轮唯一」的：`call_<盐><序号>`。
+        let index = self.tool_state.len();
+        let resolved_id = if id.is_empty() {
+            format!("call_{}{}", self.call_salt, index)
+        } else {
+            id.to_string()
+        };
         self.tool_state.push(ToolAccum {
-            id: id.to_string(),
+            id: resolved_id,
             name: name.to_string(),
             args: args.to_string(),
             announced: false,
         });
-        (self.tool_state.len() - 1) as i64
+        (index as i64, true)
     }
 
     /// 流式的 role 帧是否该发（第一次产出 delta 前补一帧 role）
@@ -402,11 +511,23 @@ impl Translator {
         self.created
     }
 
-    /// 收尾的 finish_reason：上游给了就用它，没给按「有没有工具调用」推断
+    /// 收尾的 finish_reason。
+    ///
+    /// ── 有工具调用时必须是 `tool_calls`（2026-11 实测修正）─────────
+    /// 上游把「等工具结果」也当成一轮结束，收尾帧常常给的是 `STOP`。若照抄，
+    /// 客户端会认为这轮**没有待执行的工具调用**，随后要么不回工具结果、要么把
+    /// 工具调用当成普通文本 —— 表现就是工具链路整段错位。`length` /
+    /// `content_filter` 这类「非正常收尾」仍按上游原样透传。
     pub fn final_finish_reason(&self) -> String {
-        self.finish_reason
-            .clone()
-            .unwrap_or_else(|| if self.saw_tool_call { "tool_calls".to_string() } else { "stop".to_string() })
+        if self.saw_tool_call {
+            if let Some(reason) = &self.finish_reason {
+                if reason != "stop" {
+                    return reason.clone();
+                }
+            }
+            return "tool_calls".to_string();
+        }
+        self.finish_reason.clone().unwrap_or_else(|| "stop".to_string())
     }
 
     /// 收尾的工具调用（非流式聚合用）
