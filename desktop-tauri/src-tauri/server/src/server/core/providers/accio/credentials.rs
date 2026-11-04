@@ -45,6 +45,22 @@ pub struct Credentials {
     pub name: String,
     /// 推理请求的设备指纹（本网关按账号生成）
     pub device_id: String,
+    /// **公司空间**（团队）标识。空串 = 个人空间。
+    ///
+    /// ── 它是什么（2026-10 实测）──────────────────────────────────
+    /// Accio 企业版在同一个账号下分「个人空间 / 公司空间」，两者的积分是**两个
+    /// 独立的池**。空间不是另一条端点、也不换 token，而是**每个业务请求上的
+    /// `x-team-id` 头**：桌面端的 axios 全局拦截器把当前空间的 teamId 注入到
+    /// 全部请求里，个人空间则连这个头都不带（空值会被拦截器删掉）。
+    ///
+    /// 取值的权威来源是桌面端的 `~/.accio/state/current-space.json`：
+    /// `{"kind":"team","accountId":"…","teamId":"37001","teamName":"…","role":"MEMBER"}`
+    /// —— 注意 `teamId` 是**纯团队号**（`37001`），而本地目录名
+    /// `accounts/<accountId>_<teamId>` 里的复合串是空间作用域键，**不能**直接
+    /// 拿去当请求头（两者不是一回事）。
+    pub team_id: String,
+    /// 空间名（仅展示用，例如「蒂万坦斯」）
+    pub team_name: String,
 }
 
 impl Credentials {
@@ -74,7 +90,14 @@ impl Credentials {
             email: text(payload, &["email"]).chars().take(320).collect(),
             name: text(payload, &["nickname", "name"]).chars().take(100).collect(),
             device_id: text(payload, &["deviceId", "device_id"]),
+            team_id: text(payload, &["teamId", "team_id"]),
+            team_name: text(payload, &["teamName", "team_name"]).chars().take(100).collect(),
         })
+    }
+
+    /// 是否绑定了公司空间（有 teamId 才算）
+    pub fn is_team(&self) -> bool {
+        !self.team_id.trim().is_empty()
     }
 
     /// 新账号的兜底标识：没有 userId 时按凭证指纹生成一个稳定串。
@@ -117,6 +140,8 @@ impl Credentials {
             "email": text_or_null(&self.email),
             "nickname": text_or_null(&self.name),
             "deviceId": text_or_null(&self.device_id),
+            "teamId": text_or_null(&self.team_id),
+            "teamName": text_or_null(&self.team_name),
         })
     }
 }

@@ -17,8 +17,12 @@
 
 services:
   agent2api:
+    # ── 本地构建（Accio 公司空间补丁）────────────────────────────
+    # 不用官方镜像是刻意的：本目录源码打了「Accio 支持 x-team-id（公司空间积分）」
+    # 的补丁，拉回官方 latest 会把补丁覆盖掉。重建方式：
+    #   docker compose build && docker compose up -d
     build: .
-    image: agent2api:local
+    image: agent2api:3.0.8-teamspace
     container_name: agent2api
     restart: unless-stopped
     ports:
@@ -34,9 +38,11 @@ services:
       # 登录页人机验证组件环境变量，默认为1开启，0为关闭
       AGENT2API_CAPTCHA_ENABLED: ${AGENT2API_CAPTCHA_ENABLED:-1}
       # 可选：AGENT2API_VERBOSE / AGENT2API_ALLOW_NO_KEY / AGENT2API_PROXY_PORT
-      # 容器内更新入口（面板「设置 → 软件更新」一键下载并替换）：镜像里默认 1 开启，
-      # 置 0 关闭。注意它替换的是容器里的文件，compose 里的镜像标签不变 —— 见 README「升级」。
-      AGENT2API_SELF_UPDATE: ${AGENT2API_SELF_UPDATE:-1}
+      # 容器内更新入口（面板「设置 → 软件更新」一键下载并替换）。
+      # 本地构建版**默认关**（0）：它会下载官方二进制覆盖 /usr/local/bin 下的
+      # 可执行文件，等于把本目录源码里的 Accio 补丁冲掉、且镜像标签看不出来。
+      # 想升级就 git merge + docker compose build，不要走面板自更新。
+      AGENT2API_SELF_UPDATE: ${AGENT2API_SELF_UPDATE:-0}
     volumes:
       # 全部状态（SQLite 库、配置、日志）都在这一个卷里
       - ./data:/data

@@ -184,7 +184,8 @@ pub async fn exchange_code(
         "clientId": endpoints::CLIENT_ID,
         "redirectUri": redirect_uri,
     });
-    let response = auth::post_json(region, endpoints::OAUTH_TOKEN_PATH, &body, proxy).await?;
+    // 换票是鉴权端点，不带空间维度（空间作用域体现在后续业务请求的头上）
+    let response = auth::post_json(region, endpoints::OAUTH_TOKEN_PATH, &body, None, proxy).await?;
     let data = auth::payload(response, "授权码换令牌").map(auth::unwrap_data)?;
     let access_token = credentials::secret(&data, &["accessToken", "access_token", "token"])?;
     if access_token.is_empty() {
@@ -201,16 +202,22 @@ pub async fn exchange_code(
         email: String::new(),
         name: String::new(),
         device_id: String::new(),
+        team_id: String::new(),
+        team_name: String::new(),
     };
     credentials.ensure_identity();
     // 换回来的 token 是不透明串，账号标识只能靠资料接口问一次
-    match auth::fetch_profile(&credentials.access_token, region, proxy).await {
+    let profile = auth::fetch_profile(&credentials, proxy).await;
+    match profile {
         Ok(profile) => auth::apply_profile(&mut credentials, &profile),
         Err(error) => logging::verbose(
             "[Accio]",
             &format!("登录后查资料失败（不影响落账号）: {}", error.message),
         ),
     }
+    // 空间：与「填写凭证」同一条规则（资料没给 activeTeam 时按团队列表认一次，
+    // 只有唯一 ACTIVE 团队才采纳，见 `auth::adopt_single_team`）
+    auth::adopt_single_team(&mut credentials, proxy).await;
     credentials.ensure_identity();
     Ok(credentials)
 }

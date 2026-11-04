@@ -13,6 +13,34 @@
 //!   - **没有签到**：上游没有那个活动（桌面端全包检索无「签到 / checkin」），
 //!     因此 `billing::checkin` 的范围判定把这家排除（见那边的 accio 分支）。
 //!
+//! ── 个人空间 / 公司空间（2026-10 实测，逆向 app.asar 得到）──────
+//! 企业版账号在同一个账下有两个**独立积分池**：个人空间与公司空间。空间不是
+//! 另一条端点、也不换 token，而是**每个业务请求上的 `x-team-id` 头**：
+//!
+//! ```text
+//!   桌面端 axios 全局拦截器：
+//!     e.headers = { ...currentSpaceHeaders(), ...e.headers }
+//!     //  currentSpaceHeaders() 在「当前空间是团队」时给出
+//!     //  { "x-team-id": <teamId>, "x-accio-route-region": <region> }
+//!     个人空间 → 不带头（空值会被拦截器删掉，不是带空串）
+//! ```
+//!
+//! **推理认这个头**：`/api/adk/llm/generateContent` 带 `x-team-id` 就消耗公司池，
+//! 不带走个人池（2026-10 复核；构造点见 `chat::build_plan`）。
+//!
+//! **额度接口不认**：`/api/entitlement/quota` 与 `currentSubscription` 是**账号级**
+//! 接口 —— 带了头响应一字不变（永远是个人计划那一份读数）。按空间分账的是
+//! `/api/entitlement/listUserMessageBill` 与 `queryCreditUsageTrend`：同一个 token、
+//! 同一台机器，带 `x-team-id` 与不带返回的是两个空间各自的账单/用量（实测 104 条 vs
+//! 18 条、当日 336 vs 1 积分）。所以「账号页余额」那一栏读到的必然是个人池，
+//! 空间这一维只能从账单接口看，见 `balance.rs` 模块头。
+//!
+//! 取值的权威来源是桌面端本地状态文件 `~/.accio/state/current-space.json`
+//! （`{kind, accountId, teamId, teamName, role}`，实测 `teamId` 形如 `37001`）；
+//! 注意 `~/.accio/accounts/<accountId>_<teamId>/` 里的复合串是**本地空间作用域
+//! 键**，不是可以拿去当请求头的值。网关侧把 teamId 落在账号记录的 `teamId`
+//! 字段上（空 = 个人空间），口径见 `endpoints::push_team_header`。
+//!
 //! ── 为什么走会话式转发（`is_stateful`）────────────────────────
 //! 无状态路径假设「请求体由通用层序列化后原样发出、响应是 OpenAI 的 SSE」。
 //! Accio 两条都不满足（请求体要先转成 Gemini 信封、响应要拆 ADK 的帧）。
@@ -350,16 +378,23 @@ impl ProviderAdapter for AccioAdapter {
             let plan = chat::build_plan(&context.credentials, body, &model_name, effort.as_deref())?;
             let effective_proxy = proxy.or(context.proxy);
 
+            // 空间一并落日志：团队账号反代出来的请求到底花哪个池，看这一行就够
+            // （`space=personal` = 没带 `x-team-id`，见 `chat::build_plan`）
             logging::verbose(
                 "[Accio]",
                 &format!(
-                    "POST {} model={} upstream={} stream={} region={} account={}",
+                    "POST {} model={} upstream={} stream={} region={} account={} space={}",
                     plan.url,
                     if model_name.is_empty() { "(默认)" } else { &model_name },
                     plan.upstream_key,
                     stream,
                     self.region.edition(),
                     account_id,
+                    if context.credentials.is_team() {
+                        context.credentials.team_id.as_str()
+                    } else {
+                        "personal"
+                    },
                 ),
             );
 

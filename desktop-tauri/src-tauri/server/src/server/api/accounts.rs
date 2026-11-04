@@ -1745,6 +1745,23 @@ pub async fn patch_account(state: &ServerState, id: &str, body: &Bytes) -> Respo
             Err(error) => return store_error(error),
         }
     }
+    // Accio 的**公司空间**（`teamId` / `teamName`）：与上面两段同一处境 ——
+    // 只有这一家认这两个键，不进通用 `apply_patch`。
+    //
+    // ── 为什么不走「重新添加账号」那条路 ────────────────────────
+    // 添加要求手里有 accessToken，而面板只显示 `tokenTail`；已经加好的账号补
+    // 不上 teamId。这里按 id 原地改，凭证不动，只换「读哪个空间的额度」
+    // （空间是请求头 `x-team-id`，见 `providers::accio` 模块头）。
+    if patch.get("teamId").is_some() || patch.get("teamName").is_some() {
+        match state.store().update_accio_team(
+            &id,
+            patch.get("teamId"),
+            patch.get("teamName"),
+        ) {
+            Ok(changes) => balance_changes.extend(changes),
+            Err(error) => return store_error(error),
+        }
+    }
     // 自定义账号的凭证（`apiKey` / `noAuth`）：与上面两段同一处境 —— 只有自定义
     // 家认这两个键，所以不进通用 `apply_patch`。**账号 id 由 HTTP 路径给定，
     // 改凭证不改 id**（id 是身份：限额冷却、请求日志、导出文件都按它关联），

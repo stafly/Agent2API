@@ -58,21 +58,29 @@ impl AccountStore {
         let region = credentials.region;
         let provider = region.provider_id();
         let guard = self.guard();
-        // 去重：优先按 userId（同一账号重复登录）；没有 userId 时按 accessToken 相等
+        // 去重：同一账号 + **同一空间**才算同一条记录。
+        //
+        // ── 为什么必须带上空间（2026-10 实测）──────────────────────
+        // Accio 的「个人空间 / 公司空间」用的是**同一份 token**（空间只是请求头
+        // `x-team-id`，换空间不换票）。因此只按 userId 去重会让两个空间撞成一条：
+        // 后添加的公司空间直接覆盖掉个人空间的记录，两个池的额度永远只能看到一个。
+        // 同理，只按 accessToken 相等去重也一样 —— 那串凭证本来就同时属于两个空间。
+        // 带上 teamId 之后，「同一账号的两个空间」在库里是两条独立账号。
         let existing = self
             .records_for_provider(&guard, provider)
             .into_iter()
             .find(|record| {
-                let record_region = accio_region_of(record);
-                if record_region != Some(region) {
+                if accio_region_of(record) != Some(region) {
                     return false;
                 }
                 let same_user = !credentials.user_id.is_empty()
-                    && record.user_id() == credentials.user_id;
+                    && record.user_id() == credentials.user_id
+                    && record_team_of(record) == credentials.team_id.trim();
                 let same_token = record
                     .get("accessToken")
                     .and_then(Value::as_str)
-                    .is_some_and(|value| value == credentials.access_token);
+                    .is_some_and(|value| value == credentials.access_token)
+                    && record_team_of(record) == credentials.team_id.trim();
                 same_user || same_token
             });
         let id = existing
@@ -80,7 +88,22 @@ impl AccountStore {
             .map(|record| record.id().to_string())
             .unwrap_or_else(|| {
                 let seed = if credentials.user_id.is_empty() {
-                    credentials.access_token.clone()
+                    if credentials.is_team() {
+                        // 没有 userId 时只能靠凭证指纹；团队维度也必须进种子，
+                        // 否则同一串凭证的两个空间会算出同一个 id
+                        format!("{}#{}", credentials.access_token, credentials.team_id.trim())
+                    } else {
+                        credentials.access_token.clone()
+                    }
+                } else if credentials.is_team() {
+                    // 团队空间：在历史形态后再加一段，个人空间的 id 因此逐字不变
+                    // （既有账号不会被重新添加时算出一个新 id 而变成重复记录）
+                    format!(
+                        "{}-{}-{}",
+                        region.edition(),
+                        credentials.user_id,
+                        credentials.team_id.trim()
+                    )
                 } else {
                     format!("{}-{}", region.edition(), credentials.user_id)
                 };
@@ -102,7 +125,7 @@ impl AccountStore {
             .map(str::to_string)
             .or_else(|| existing.as_ref().map(StoredAccount::name).filter(|value| !value.is_empty()))
             .unwrap_or_else(|| {
-                if !credentials.name.is_empty() {
+                let base = if !credentials.name.is_empty() {
                     credentials.name.clone()
                 } else if !credentials.email.is_empty() {
                     credentials.email.clone()
@@ -110,6 +133,18 @@ impl AccountStore {
                     format!("Accio {}", credentials.user_id)
                 } else {
                     format!("Accio {}账号", region.label())
+                };
+                // 同一账号的两个空间是两条记录：不标空间名在列表里会长得一模一样，
+                // 用户根本分不清哪条是公司池（备注名由用户显式给过时不加后缀）
+                if credentials.is_team() {
+                    let space = if credentials.team_name.trim().is_empty() {
+                        credentials.team_id.trim().to_string()
+                    } else {
+                        credentials.team_name.trim().to_string()
+                    };
+                    format!("{base}（{space}）")
+                } else {
+                    base
                 }
             });
         let mut fields = existing
@@ -171,6 +206,62 @@ impl AccountStore {
         Ok(self.public_account(&record))
     }
 
+    /// 给**已有**账号设置 / 清除公司空间标识（`teamId` / `teamName`）。
+    ///
+    /// ── 为什么需要单独一个入口（而不是让用户重新添加一次）──────────
+    /// 添加账号那条路要求手里有 accessToken，而面板只显示 `tokenTail` —— 已经
+    /// 加好的账号没法靠「再添加一次」补上 teamId。这里按 id 原地改，凭证一个字
+    /// 不动：改的只是「这条记录读哪个空间的额度」。
+    ///
+    /// 取值语义：`null` 或空串 = 清除（回到个人空间）；其余按 trim 后的文本落盘。
+    /// 长度与控制字符做防御性校验（与凭证字段同一口径），避免把脏值落进库。
+    pub fn update_accio_team(
+        &self,
+        account_id: &str,
+        team_id: Option<&Value>,
+        team_name: Option<&Value>,
+    ) -> Result<Vec<String>, AccountStoreError> {
+        let guard = self.guard();
+        let Some(mut record) = self.record_by_id(&guard, account_id) else {
+            return Err(AccountStoreError::new("账号不存在", 404));
+        };
+        if !super::is_accio_family(&record.provider()) {
+            return Err(AccountStoreError::new(
+                "只有 Accio 账号有公司空间设置（teamId）",
+                400,
+            ));
+        }
+        let mut changes = Vec::new();
+        for (key, value, limit) in [
+            ("teamId", team_id, 64usize),
+            ("teamName", team_name, 100usize),
+        ] {
+            let Some(value) = value else { continue };
+            let text = match value {
+                Value::Null => String::new(),
+                Value::String(text) => text.trim().to_string(),
+                _ => {
+                    return Err(AccountStoreError::bad_request(format!(
+                        "{key} 必须是字符串或 null"
+                    )))
+                }
+            };
+            if text.chars().count() > limit || text.chars().any(char::is_control) {
+                return Err(AccountStoreError::bad_request(format!("{key} 过长或含非法字符")));
+            }
+            // 清空就删键：记录里不留空串，去重与判定都按「有没有这个字段」走
+            if text.is_empty() {
+                record.fields_mut().remove(key);
+            } else {
+                record.fields_mut().insert(key.to_string(), Value::String(text));
+            }
+            changes.push(key.to_string());
+        }
+        record.set_updated_at(logging::now_ms());
+        self.with_conn(&guard, |conn| sql::update_in_place(conn, &record))?;
+        Ok(changes)
+    }
+
     /// 刷新结果回写（比较-再写：记录里的凭证仍是刷新前那份才写）
     pub fn update_accio_credentials_if_current(
         &self,
@@ -218,9 +309,18 @@ impl AccountStore {
             .map(|credentials| credentials.can_refresh())
             .unwrap_or(false);
         let mut public = Map::new();
-        for key in ["id", "provider", "name", "userId", "email", "nickname", "source", "tokenTail", "expiresAt"] {
+        for key in ["id", "provider", "name", "userId", "email", "nickname", "source", "tokenTail", "expiresAt", "teamId", "teamName"] {
             public.insert(key.to_string(), record.get(key).cloned().unwrap_or(Value::Null));
         }
+        // 空间标注（前端在账号卡片上区分个人 / 公司空间；空 teamId = 个人空间）
+        public.insert(
+            "space".to_string(),
+            Value::String(if record_team_of(record).is_empty() {
+                "personal".to_string()
+            } else {
+                "team".to_string()
+            }),
+        );
         public.insert(
             "edition".to_string(),
             region
@@ -258,4 +358,16 @@ impl AccountStore {
 /// 冗余信息，改错了不该影响分派。
 fn accio_region_of(record: &StoredAccount) -> Option<Region> {
     Region::from_provider_id(&record.provider())
+}
+
+/// 记录绑定的公司空间 teamId（个人空间 → 空串）。
+///
+/// 与 [`accio_region_of`] 同一形态：这是个**身份判据**，去重、ID 生成、展示都按
+/// 它走，别处不要再各自拼 `record.get("teamId")`。
+fn record_team_of(record: &StoredAccount) -> &str {
+    record
+        .get("teamId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("")
 }

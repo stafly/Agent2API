@@ -50,6 +50,11 @@ pub const USER_INFO_PATH: &str = "/api/auth/userinfo";
 pub const QUOTA_PATH: &str = "/api/entitlement/quota";
 /// 订阅详情
 pub const SUBSCRIPTION_PATH: &str = "/api/entitlement/currentSubscription";
+/// 我加入了哪些团队（POST，body `{utdid, version, accessToken}`）→ `data: [{teamId, teamName, role, status, …}]`。
+///
+/// `userinfo.activeTeam` 只在服务端会话已经切过空间时才有值（实测多数账号是
+/// `null`），所以「这个账号能进哪些公司空间」只能问这一条。见 `auth::adopt_single_team`。
+pub const TEAMS_PATH: &str = "/api/team/queryUserTeams";
 /// 模型目录（完整版）。
 ///
 /// ── 为什么是 v1 而不是 v2（2026-09 实测）───────────────────
@@ -212,6 +217,29 @@ pub fn app_key() -> String {
     env_text("ACCIO_APP_KEY").unwrap_or_else(|| DEFAULT_APP_KEY.to_string())
 }
 
+/// 推理请求的 `User-Agent`（`ACCIO_USER_AGENT` 可覆盖）。
+///
+/// ── 为什么必须显式给，而且不能沿用全局默认（2026-10 实测，可复现）──
+/// `egress` 的客户端默认 UA 是 `undici`（计费接口缺 UA 会 403，见那边模块头），
+/// 可阿里侧对 ADK 推理端点有一道风控规则**恰好把它拉黑**：同一个 token、同一台
+/// 机器、同一组头，只在这个头与别的取值之间来回换，结果就跟着翻转 ——
+///
+/// ```text
+///   User-Agent: undici            → HTTP 200 + 约 1.2 KB 的 punish 拦截页（无 SSE 帧）
+///   User-Agent: curl/7.88.1       → 正常出流
+///   User-Agent: accio-work/0.32.6 → 正常出流
+///   （完全不发这个头）             → 正常出流
+/// ```
+///
+/// 桌面端这条链路**不发 UA**（ADK SDK 走 `undici.request` 而非 `fetch`，前者不注入
+/// `user-agent`），所以从没踩到这条规则；网关的客户端级默认头又必须保留（计费链路
+/// 靠它），于是只能在**推理请求上逐条覆盖**。取值与自家客户端同形
+/// （`<client_id>/<版本号>`）：既不是浏览器 UA，也不在任何风控黑名单上。
+pub fn user_agent() -> String {
+    env_text("ACCIO_USER_AGENT")
+        .unwrap_or_else(|| format!("{}/{}", CLIENT_ID, DEFAULT_APP_VERSION))
+}
+
 /// 读一个环境变量并去掉空白；空串按「没设」处理
 fn env_text(key: &str) -> Option<String> {
     std::env::var(key)
@@ -229,8 +257,8 @@ fn env_text(key: &str) -> Option<String> {
 /// **刻意不带 `Authorization`**：桌面端一个请求都不带它，鉴权全靠 body/query
 /// 里的 `accessToken`；多一个上游没见过的头只会徒增风控面。
 /// 未验证项与实测口径见 `mod.rs` 模块头的「未验证项」一节。
-pub fn api_headers(region: Region) -> Vec<(String, String)> {
-    vec![
+pub fn api_headers(region: Region, team_id: Option<&str>) -> Vec<(String, String)> {
+    let mut headers = vec![
         ("Content-Type".to_string(), "application/json".to_string()),
         ("Accept".to_string(), "application/json".to_string()),
         ("Accept-Language".to_string(), ACCEPT_LANGUAGE.to_string()),
@@ -242,5 +270,22 @@ pub fn api_headers(region: Region) -> Vec<(String, String)> {
             env_text("ACCIO_APP_VERSION").unwrap_or_else(|| DEFAULT_APP_VERSION.to_string()),
         ),
         ("x-package-region".to_string(), region.package_region().to_string()),
-    ]
+    ];
+    push_team_header(&mut headers, team_id);
+    headers
+}
+
+/// 空间（公司空间）标识头 `x-team-id`。
+///
+/// ── 为什么是「可选追加」而不是固定字段（2026-10 实测）──────────
+/// 个人空间下桌面端**根本不会带这个头**（拦截器里 `t && !e.headers['x-team-id']
+/// && delete e.headers['x-team-id']` —— 空值会被删掉），所以这里的口径必须与它
+/// 一致：只有 teamId **非空**才追加，绝不落一个空值。带空值不是「等价于个人
+/// 空间」，而是给上游一个它从没见过的形态，平白多一层风控面。
+///
+/// 取值是**纯团队号**（如 `37001`），不是本地目录名里的 `账号_团队` 复合串。
+pub fn push_team_header(headers: &mut Vec<(String, String)>, team_id: Option<&str>) {
+    if let Some(team) = team_id.map(str::trim).filter(|value| !value.is_empty()) {
+        headers.push(("x-team-id".to_string(), team.to_string()));
+    }
 }

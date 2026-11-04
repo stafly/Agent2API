@@ -120,12 +120,30 @@ pub fn build_plan(
         // 的普通文本（HTTP 200 + 正常帧形态），会被当成模型输出吐给下游。
         // 见 `endpoints::DEFAULT_APP_KEY`。
         ("appKey".to_string(), endpoints::app_key()),
+        // **必须覆盖全局默认的 `undici`**：阿里风控把那个 UA 拉黑在推理端点上，
+        // 命中时回的是「HTTP 200 + punish 拦截页」而没有任何 SSE 帧（表现为空回答）。
+        // 实测口径见 `endpoints::user_agent`。
+        ("User-Agent".to_string(), endpoints::user_agent()),
     ];
     // 设备指纹（每条账号自带一个；缺省也能发，但带上更接近真实客户端）
     if !credentials.device_id.is_empty() {
         headers.push(("utdid".to_string(), credentials.device_id.clone()));
     }
     headers.push(("version".to_string(), endpoints::DEFAULT_APP_VERSION.to_string()));
+    // ── 公司空间（团队）身份：`x-team-id` **必须带**（2026-10 复核）──────
+    // 上游按这个头决定「这笔请求花哪个积分池」：空间不换 token、不换端点，就是每个
+    // 请求上的一个头（桌面端的全局拦截器与 ADK SDK 的 `getExtraHeaders` 都这么加，
+    // 见 `endpoints::push_team_header`）。少了它，团队账号的推理只会走**个人**池 ——
+    // 一个已经登录公司空间的账号，反代出来永远是个人额度。
+    //
+    // ── 上一版为什么把它删了（那次判断是错的）──────────────────────
+    // 原注释写的是「带头 → 上游立刻回空流（200 + 65ms + tokens=0+0）」。复核结论：
+    // 那个「空流」其实是阿里风控的**拦截页**（HTTP 200 + 约 1.2 KB HTML，一个
+    // `data:` 帧都没有，耗时 60~70 ms），**不带**这个头时同样会出现（同机器同 token，
+    // 隔几分钟即恢复，与头无关）。为了让这类响应不再被误读成「模型没回话」，现在由
+    // [`non_sse_error`] 明确报错，空回答不再静默发生。
+    let team_id = credentials.is_team().then_some(credentials.team_id.as_str());
+    endpoints::push_team_header(&mut headers, team_id);
 
     let body_bytes = serde_json::to_vec(&built.body)
         .map_err(|_| GatewayError::with_status(500, "Accio 请求体序列化失败"))?;
@@ -319,6 +337,67 @@ fn tail_frames(translator: &mut Translator) -> String {
     out
 }
 
+/// 首段原始字节的保留上限（够认出「这是不是 SSE」即可，不留全量）
+const RAW_HEAD_LIMIT: usize = 600;
+
+/// 记下响应的前若干字节（判「回的不是 SSE」用）
+fn keep_head(raw: &mut Vec<u8>, chunk: &[u8]) {
+    if raw.len() >= RAW_HEAD_LIMIT || chunk.is_empty() {
+        return;
+    }
+    let take = (RAW_HEAD_LIMIT - raw.len()).min(chunk.len());
+    raw.extend_from_slice(&chunk[..take]);
+}
+
+/// 「上游回的不是 SSE」→ 一句能查下去的错误；正常 SSE 回 `None`。
+///
+/// ── 为什么必须判（2026-10 实测）─────────────────────────────
+/// 阿里风控拦下请求时**不看 HTTP 语义**：状态码 200、body 是一页约 1.2 KB 的
+/// HTML（`<a id="a-link" …>` + `x5secdata` 那个 punish 模板），一个 `data:` 帧
+/// 都没有。老实现会把它读成「上游什么都没说」，于是流式下发一个只有收尾帧的
+/// 空回答、非流式下发 `content: null` 的 200 —— 下游客户端只会反复重试，
+/// 用户看到的是「模型不回话」，而真正的原因在别处（风控 / 出口 IP / 上游故障）。
+/// 这一条把它翻成可行动的 502：能换号就换号，不能换号也把首个片段带出去。
+fn non_sse_error(raw: &[u8]) -> Option<GatewayError> {
+    let text = String::from_utf8_lossy(raw);
+    let head = text.trim_start();
+    if head.is_empty() {
+        return Some(
+            GatewayError::with_status(502, "Accio 上游返回空响应：HTTP 200 但没有任何 SSE 帧")
+                .with_code("accio_empty_stream"),
+        );
+    }
+    // SSE 的行只有这几种开头（`:` 是心跳、`id:` 是事件 id）
+    if head.starts_with("data:")
+        || head.starts_with("event:")
+        || head.starts_with("id:")
+        || head.starts_with(':')
+    {
+        return None;
+    }
+    let brief: String = head.chars().take(160).collect();
+    let lower = head.to_ascii_lowercase();
+    // 风控拦截页：`a-link` / `x5secdata` / `punish` 三个特征命中任意一个即可判定
+    if lower.contains("x5secdata") || lower.contains("punish") || lower.contains("<a id=\"a-link\"") {
+        return Some(
+            GatewayError::with_status(
+                502,
+                format!(
+                    "Accio 上游返回风控拦截页（HTTP 200 + HTML，无任何 SSE 帧）：多为访问频率/出口 IP 被判定可疑，隔几分钟再试通常恢复；持续出现请换出口 IP 或先用 Accio 桌面端确认账号可用。首个片段：{brief}"
+                ),
+            )
+            .with_code("accio_waf_blocked"),
+        );
+    }
+    Some(
+        GatewayError::with_status(
+            502,
+            format!("Accio 上游返回的不是 SSE（无任何 SSE 帧）：{brief}"),
+        )
+        .with_code("accio_bad_response"),
+    )
+}
+
 /// 首帧预读：把上游拉到第一个**有内容或结束**的帧，决定「能不能交给客户端」。
 ///
 /// 返回 `(预读到的帧, 剩余字节流)`。首帧前就撞上错误 → 交回带状态码的 `Err`，
@@ -336,10 +415,13 @@ pub(super) async fn prefetch_stream_head(
     );
     let mut buffer = LineBuffer::new();
     let mut frames: Vec<Frame> = Vec::new();
+    // 首个片段留一份：一帧都解析不出来时要靠它区分「风控页 / 网关错误页 / 真空流」
+    let mut raw: Vec<u8> = Vec::new();
     while let Some(item) = source.next().await {
         let chunk = item.map_err(|error| {
             GatewayError::with_status(502, format!("Accio 上游流式传输中断: {error}"))
         })?;
+        keep_head(&mut raw, &chunk);
         let text = String::from_utf8_lossy(&chunk).to_string();
         for line in buffer.push(&text) {
             let Some(data) = line.strip_prefix("data:") else {
@@ -375,7 +457,13 @@ pub(super) async fn prefetch_stream_head(
             }
         }
     }
-    // 流在没有任何内容帧之前就结束了：交给下游按「空回答」收尾
+    // 流在没有任何内容帧之前就结束了：先判「回的根本不是 SSE」（风控页 / 错误页），
+    // 是的话按 502 交回编排层换号，而不是下发一个空回答
+    if frames.is_empty() {
+        if let Some(error) = non_sse_error(&raw) {
+            return Err(error);
+        }
+    }
     Ok((frames, source))
 }
 
@@ -467,6 +555,9 @@ pub async fn drive_aggregate(
 ) -> Result<Value, GatewayError> {
     let mut source = response.bytes_stream();
     let mut buffer = LineBuffer::new();
+    // 与 `prefetch_stream_head` 同一口径：留首个片段，用来认出「这不是 SSE」
+    let mut raw: Vec<u8> = Vec::new();
+    let mut saw_frame = false;
     loop {
         let Some(item) = source.next().await else {
             break;
@@ -477,6 +568,7 @@ pub async fn drive_aggregate(
                 format!("Accio 上游流式传输中断: {}", egress::describe_error_detail(&error)),
             )
         })?;
+        keep_head(&mut raw, &chunk);
         let text = String::from_utf8_lossy(&chunk).to_string();
         for line in buffer.push(&text) {
             let Some(data) = line.strip_prefix("data:") else {
@@ -485,6 +577,7 @@ pub async fn drive_aggregate(
             let Some(frame) = stream::parse_frame(data) else {
                 continue;
             };
+            saw_frame = true;
             if frame.is_error() {
                 let error = frame_error(&frame);
                 if error.status_code == 429 {
@@ -497,6 +590,12 @@ pub async fn drive_aggregate(
             if frame.turn_complete {
                 return Ok(completion_body(&translator));
             }
+        }
+    }
+    // 一帧都没解析到：先判「回的不是 SSE」（风控页 / 错误页），别下发空回答
+    if !saw_frame {
+        if let Some(error) = non_sse_error(&raw) {
+            return Err(error);
         }
     }
     Ok(completion_body(&translator))

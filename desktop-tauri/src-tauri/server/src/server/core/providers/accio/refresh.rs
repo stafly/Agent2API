@@ -89,7 +89,15 @@ async fn refresh_and_save(
         "accessToken": credentials.access_token,
         "refreshToken": credentials.refresh_token,
     });
-    let response = auth::post_json(credentials.region, endpoints::REFRESH_TOKEN_PATH, &body, proxy.as_ref())
+    let response = auth::post_json(
+        credentials.region,
+        endpoints::REFRESH_TOKEN_PATH,
+        &body,
+        // 续期是**鉴权端点**，不带空间维度：token 的作用域在签发时就定了，
+        // 给续期请求加 x-team-id 既无意义又会多出上游没见过的形态
+        None,
+        proxy.as_ref(),
+    )
         .await?;
     let data = auth::payload(response, "凭证续期").map(auth::unwrap_data)?;
     let token = credentials::secret(&data, &["accessToken", "access_token", "token"])?;

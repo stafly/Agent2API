@@ -437,7 +437,10 @@ pub async fn refresh(
     let mut last_error: Option<String> = None;
     let mut models: Vec<Value> = Vec::new();
     for path in [endpoints::MODEL_CONFIG_PATH, endpoints::MODEL_CONFIG_PATH_V2] {
-        let response = match auth::post_json(region, path, &body, proxy).await {
+        // 目录**不按空间区分**：网关的目录缓存是「一家 provider 一份」（见
+        // `catalog_cache`），带空间会让缓存语义变成「按空间各一份」，而这个改动
+        // 不在本次范围内 —— 清单本身在个人/公司空间下是一致的
+        let response = match auth::post_json(region, path, &body, None, proxy).await {
             Ok(response) => response,
             Err(error) => {
                 last_error = Some(format!("目录请求失败：{}", error.message));
