@@ -39,6 +39,27 @@ cd E:\Program\DOCKER\agent2api-342
 脚本做四件事：在 `rust:1-bookworm` 容器里 `cargo build --no-default-features --features accio` →
 拷进 `plugins/agent2api-providers/<version>/` → 写 `plugins.json` 登记项（`signed=false` + 真实 sha256）→ 重启网关。
 
+## Docker 里加账号：网页登录的回调要发布端口
+
+Accio 的网页登录是 **loopback 回调**：插件随机绑一个 `127.0.0.1:<port>`，把
+`http://127.0.0.1:<port>/auth/callback-accio` 放进授权地址。插件跑在**容器内**，
+那个 127.0.0.1 是容器自己的回环 —— 宿主机浏览器打开只会看到
+`ERR_CONNECTION_REFUSED`，面板上表现为「一直等回调」。
+
+v3.4.4 起插件认 `ACCIO_CALLBACK_PORT`：设了就绑 `0.0.0.0:<port>` 的固定端口。
+容器要这样起：
+
+```powershell
+docker run -d --name agent2api-342 --restart unless-stopped `
+  -p 3066:3065 -p 127.0.0.1:44797:44797 -e ACCIO_CALLBACK_PORT=44797 `
+  -v E:\Program\DOCKER\agent2api-342\data342:/data agent2api:3.4.2-teamspace
+```
+
+登录日志会写 `Accio OAuth 回调已监听 0.0.0.0（容器部署…）:44797/auth/callback-accio`。
+同一时刻只能有一轮登录占用该端口。
+
+**不想走网页登录**时，添加账号改用「Token / 凭证」方式直接粘贴 accessToken 即可。
+
 ## 三个坑
 
 1. **必须带版本目录**：网关按 `plugins/<id>/<version>/pack.json` 找，平铺会报「清单读不出来」。
